@@ -6,15 +6,18 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
 
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
@@ -25,6 +28,7 @@ import (
 	"tailscale.com/tsnet"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/ctxkey"
+	"tailscale.com/util/multierr"
 	"tailscale.com/util/set"
 )
 
@@ -33,6 +37,19 @@ var whoIsKey = ctxkey.New("", (*apitype.WhoIsResponse)(nil))
 var counterNumRequestsProxied = clientmetric.NewCounter("k8s_auth_proxy_requests_proxied")
 
 type apiServerProxyMode int
+
+func (a apiServerProxyMode) String() string {
+	switch a {
+	case apiserverProxyModeDisabled:
+		return "disabled"
+	case apiserverProxyModeEnabled:
+		return "auth"
+	case apiserverProxyModeNoAuth:
+		return "noauth"
+	default:
+		return "unknown"
+	}
+}
 
 const (
 	apiserverProxyModeDisabled apiServerProxyMode = iota
@@ -97,26 +114,7 @@ func maybeLaunchAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config,
 	if err != nil {
 		startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
 	}
-	go runAPIServerProxy(s, rt, zlog.Named("apiserver-proxy"), mode)
-}
-
-// apiserverProxy is an http.Handler that authenticates requests using the Tailscale
-// LocalAPI and then proxies them to the Kubernetes API.
-type apiserverProxy struct {
-	log *zap.SugaredLogger
-	lc  *tailscale.LocalClient
-	rp  *httputil.ReverseProxy
-}
-
-func (h *apiserverProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	who, err := h.lc.WhoIs(r.Context(), r.RemoteAddr)
-	if err != nil {
-		h.log.Errorf("failed to authenticate caller: %v", err)
-		http.Error(w, "failed to authenticate caller", http.StatusInternalServerError)
-		return
-	}
-	counterNumRequestsProxied.Add(1)
-	h.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
+	go runAPIServerProxy(s, rt, zlog.Named("apiserver-proxy"), mode, restConfig.Host)
 }
 
 // runAPIServerProxy runs an HTTP server that authenticates requests using the
@@ -133,7 +131,7 @@ func (h *apiserverProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //     are passed through to the Kubernetes API.
 //
 // It never returns.
-func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLogger, mode apiServerProxyMode) {
+func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLogger, mode apiServerProxyMode, host string) {
 	if mode == apiserverProxyModeDisabled {
 		return
 	}
@@ -141,7 +139,7 @@ func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLo
 	if err != nil {
 		log.Fatalf("could not listen on :443: %v", err)
 	}
-	u, err := url.Parse(fmt.Sprintf("https://%s:%s", os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT_HTTPS")))
+	u, err := url.Parse(host)
 	if err != nil {
 		log.Fatalf("runAPIServerProxy: failed to parse URL %v", err)
 	}
@@ -150,46 +148,19 @@ func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLo
 	if err != nil {
 		log.Fatalf("could not get local client: %v", err)
 	}
+
 	ap := &apiserverProxy{
-		log: log,
-		lc:  lc,
-		rp: &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				// Replace the URL with the Kubernetes APIServer.
-
-				r.Out.URL.Scheme = u.Scheme
-				r.Out.URL.Host = u.Host
-				if mode == apiserverProxyModeNoAuth {
-					// If we are not providing authentication, then we are just
-					// proxying to the Kubernetes API, so we don't need to do
-					// anything else.
-					return
-				}
-
-				// We want to proxy to the Kubernetes API, but we want to use
-				// the caller's identity to do so. We do this by impersonating
-				// the caller using the Kubernetes User Impersonation feature:
-				// https://kubernetes.io/docs/reference/access-authn-authz/authentication/#user-impersonation
-
-				// Out of paranoia, remove all authentication headers that might
-				// have been set by the client.
-				r.Out.Header.Del("Authorization")
-				r.Out.Header.Del("Impersonate-Group")
-				r.Out.Header.Del("Impersonate-User")
-				r.Out.Header.Del("Impersonate-Uid")
-				for k := range r.Out.Header {
-					if strings.HasPrefix(k, "Impersonate-Extra-") {
-						r.Out.Header.Del(k)
-					}
-				}
-
-				// Now add the impersonation headers that we want.
-				if err := addImpersonationHeaders(r.Out, log); err != nil {
-					panic("failed to add impersonation headers: " + err.Error())
-				}
-			},
-			Transport: rt,
+		log:         log,
+		lc:          lc,
+		mode:        mode,
+		upstreamURL: u,
+		s:           s,
+	}
+	ap.rp = &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			ap.addImpersonationHeadersAsRequired(pr.Out)
 		},
+		Transport: rt,
 	}
 	hs := &http.Server{
 		// Kubernetes uses SPDY for exec and port-forward, however SPDY is
@@ -201,20 +172,159 @@ func runAPIServerProxy(s *tsnet.Server, rt http.RoundTripper, log *zap.SugaredLo
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 		Handler:      ap,
 	}
-	log.Infof("listening on %s", ln.Addr())
+	log.Infof("API server proxy in %q mode is listening on %s", mode, ln.Addr())
 	if err := hs.ServeTLS(ln, "", ""); err != nil {
 		log.Fatalf("runAPIServerProxy: failed to serve %v", err)
 	}
 }
 
-const (
-	// oldCapabilityName is a legacy form of
-	// tailfcg.PeerCapabilityKubernetes capability. The only capability rule
-	// that is respected for this form is group impersonation - for
-	// backwards compatibility reasons.
-	// TODO (irbekrm): determine if anyone uses this and remove if possible.
-	oldCapabilityName = "https://" + tailcfg.PeerCapabilityKubernetes
-)
+// apiserverProxy is an http.Handler that authenticates requests using the Tailscale
+// LocalAPI and then proxies them to the Kubernetes API.
+type apiserverProxy struct {
+	log *zap.SugaredLogger
+	lc  *tailscale.LocalClient
+	rp  *httputil.ReverseProxy
+
+	mode        apiServerProxyMode
+	s           *tsnet.Server
+	upstreamURL *url.URL
+}
+
+func (h *apiserverProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	who, err := h.lc.WhoIs(r.Context(), r.RemoteAddr)
+	if err != nil {
+		h.log.Errorf("failed to authenticate caller: %v", err)
+		http.Error(w, "failed to authenticate caller", http.StatusInternalServerError)
+		return
+	}
+	if who == nil {
+		h.log.Errorf("unable to determine caller from remote addr %v", r.RemoteAddr)
+	}
+	counterNumRequestsProxied.Add(1)
+	if r.Method != "POST" || r.Header.Get("Upgrade") != "SPDY/3.1" {
+		h.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
+		return
+	}
+
+	spdyH := &spdyHijacker{
+		s:              h.s,
+		req:            r,
+		who:            who,
+		ResponseWriter: w,
+		log:            h.log,
+	}
+
+	h.rp.ServeHTTP(spdyH, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
+}
+
+func (h *apiserverProxy) addImpersonationHeadersAsRequired(r *http.Request) {
+	r.URL.Scheme = h.upstreamURL.Scheme
+	r.URL.Host = h.upstreamURL.Host
+	if h.mode == apiserverProxyModeNoAuth {
+		// If we are not providing authentication, then we are just
+		// proxying to the Kubernetes API, so we don't need to do
+		// anything else.
+		return
+	}
+
+	// We want to proxy to the Kubernetes API, but we want to use
+	// the caller's identity to do so. We do this by impersonating
+	// the caller using the Kubernetes User Impersonation feature:
+	// https://kubernetes.io/docs/reference/access-authn-authz/authentication/#user-impersonation
+
+	// Out of paranoia, remove all authentication headers that might
+	// have been set by the client.
+	r.Header.Del("Authorization")
+	r.Header.Del("Impersonate-Group")
+	r.Header.Del("Impersonate-User")
+	r.Header.Del("Impersonate-Uid")
+	for k := range r.Header {
+		if strings.HasPrefix(k, "Impersonate-Extra-") {
+			r.Header.Del(k)
+		}
+	}
+
+	// Now add the impersonation headers that we want.
+	if err := addImpersonationHeaders(r, h.log); err != nil {
+		log.Fatalf("failed to add impersonation headers: " + err.Error())
+	}
+}
+
+// spdyHijacker implements net/http#Hijacker interface. It allows to intercept
+// kubectl exec sessions and send them to an available tsrecorder instance if so
+// configured, before allowing the API server proxy to forward them to kube API server.
+// https://pkg.go.dev/net/http#Hijacker
+type spdyHijacker struct {
+	http.ResponseWriter
+	s   *tsnet.Server
+	req *http.Request
+	who *apitype.WhoIsResponse
+	log *zap.SugaredLogger
+}
+
+// Hijack looks at a connection from a client and, if the request if for kubectl
+// exec and session recording is required, configures the request to be
+// forwarded to an available tsrecorder instance else returns the connection as
+// is for the API server proxy to forward it to the kube API server.
+func (h *spdyHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	reqConn, brw, err := h.ResponseWriter.(http.Hijacker).Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	// e.g. "/api/v1/namespaces/default/pods/foobar/exec
+	suf, ok := strings.CutPrefix(h.req.URL.Path, "/api/v1/namespaces/")
+	if !ok {
+		return reqConn, brw, nil
+	}
+	ns, suf, ok := strings.Cut(suf, "/pods/")
+	if !ok {
+		return reqConn, brw, nil
+	}
+	pod, action, ok := strings.Cut(suf, "/")
+	if !ok {
+		return reqConn, brw, nil
+	}
+	if action != "exec" {
+		return reqConn, brw, nil
+	}
+
+	failOpen, addrs, err := determineRecorderConfig(h.who)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error trying to determine whether the 'kubectl exec' session needs to be recorded: %w", err)
+	}
+	// No need to record
+	if failOpen && len(addrs) == 0 {
+		return reqConn, brw, nil
+	}
+
+	// Log this line only after it has been determined that users have set
+	// some recording config in grants, else it might be confusing.
+	h.log.Infof("recorder addrs: %v, failOpen: %v", addrs, failOpen)
+
+	if !failOpen && len(addrs) == 0 {
+		defer reqConn.Close()
+		msg := "forbidden: 'kubectl exec' session must be recorded, but no recorders are available."
+		resp := sessionForbiddenResp(msg)
+		err = resp.Write(reqConn)
+		if err != nil {
+			return nil, nil, multierr.New(errors.New(msg), err)
+		}
+		return nil, nil, errors.New(msg)
+	}
+	recOpts := recOpts{
+		failOpen:      failOpen,
+		recorderAddrs: addrs,
+		conn:          reqConn,
+		brw:           brw,
+		ns:            ns,
+		pod:           pod,
+	}
+	conn, err := h.setupRecording(recOpts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error setting up session recording: %w", err)
+	}
+	return conn, brw, nil
+}
 
 // addImpersonationHeaders adds the appropriate headers to r to impersonate the
 // caller when proxying to the Kubernetes API. It uses the WhoIsResponse stashed
@@ -266,3 +376,12 @@ func addImpersonationHeaders(r *http.Request, log *zap.SugaredLogger) error {
 	}
 	return nil
 }
+
+const (
+	// oldCapabilityName is a legacy form of
+	// tailfcg.PeerCapabilityKubernetes capability. The only capability rule
+	// that is respected for this form is group impersonation - for
+	// backwards compatibility reasons.
+	// TODO (irbekrm): determine if anyone uses this and remove if possible.
+	oldCapabilityName = "https://" + tailcfg.PeerCapabilityKubernetes
+)
