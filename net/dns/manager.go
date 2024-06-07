@@ -22,6 +22,7 @@ import (
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
@@ -54,6 +55,10 @@ type Manager struct {
 	os       OSConfigurator
 	knobs    *controlknobs.Knobs // or nil
 	goos     string              // if empty, gets set to runtime.GOOS
+
+	// The last configuration we successfully compiled.  Set to
+	// nil on failure
+	config *Config
 }
 
 // NewManagers created a new manager from the given config.
@@ -79,6 +84,23 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, 
 		knobs:    knobs,
 		goos:     goos,
 	}
+
+	// Rate limit our attempts to correct our DNS configuration.  The recovery func is triggered
+	// by SERVFAIL errors, which can be occurring in batches at relatively high frequency.
+	limiter := rate.NewLimiter(1.0/5.0, 1)
+
+	// This will recompile the DNS config, which in turn will requery the system
+	// DNS settings.
+	m.resolver.SetServFailRecovery(func() {
+		if m.config == nil {
+			return
+		}
+		if limiter.Allow() {
+			m.logf("DNS resolution failed due to missing upstream nameservers.  Recompiling DNS configuration.")
+			m.Set(*m.config)
+		}
+	})
+
 	m.ctx, m.ctxCancel = context.WithCancel(context.Background())
 	m.logf("using %T", m.os)
 	return m
@@ -94,6 +116,7 @@ func (m *Manager) Set(cfg Config) error {
 
 	rcfg, ocfg, err := m.compileConfig(cfg)
 	if err != nil {
+		m.config = nil
 		return err
 	}
 
@@ -105,13 +128,17 @@ func (m *Manager) Set(cfg Config) error {
 	}))
 
 	if err := m.resolver.SetConfig(rcfg); err != nil {
+		m.config = nil
 		return err
 	}
 	if err := m.os.SetDNS(ocfg); err != nil {
+		m.config = nil
 		m.health.SetDNSOSHealth(err)
 		return err
 	}
+
 	m.health.SetDNSOSHealth(nil)
+	m.config = &cfg
 
 	return nil
 }
