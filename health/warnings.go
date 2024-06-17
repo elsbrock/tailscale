@@ -212,3 +212,12 @@ var controlHealthWarnable = Register(&Warnable{
 		return fmt.Sprintf("The coordination server is reporting an health issue: %v", args[ArgError])
 	},
 })
+
+// captivePortalWarnable is a Warnable which is set to an unhealthy state when a captive portal is detected.
+var captivePortalWarnable = Register(&Warnable{
+	Code:                "captive-portal-detected",
+	Title:               "Captive portal detected",
+	Severity:            SeverityHigh, // High severity because it blocks all traffic
+	Text:                StaticMessage("This Wi-Fi network requires you to sign in manually."),
+	ImpactsConnectivity: true,
+})
