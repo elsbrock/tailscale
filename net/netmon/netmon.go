@@ -109,6 +109,7 @@ type ChangeDelta struct {
 
 	// TODO(bradfitz): add some lazy cached fields here as needed with methods
 	// on *ChangeDelta to let callers ask specific questions
+	Rebind bool
 }
 
 // New instantiates and starts a monitoring instance.
@@ -448,6 +449,8 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 			m.logf("[unexpected] old: %s", jsonSummary(oldState))
 			m.logf("[unexpected] new: %s", jsonSummary(newState))
 		}
+
+		delta.Rebind = true
 	}
 	// See if we have a queued or new time jump signal.
 	if timeJumped {
