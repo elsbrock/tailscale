@@ -57,7 +57,7 @@ Windows][].  See also the dependencies in the [Tailscale CLI][].
  - [github.com/tailscale/go-winio](https://pkg.go.dev/github.com/tailscale/go-winio) ([MIT](https://github.com/tailscale/go-winio/blob/c4f33415bf55/LICENSE))
  - [github.com/tailscale/hujson](https://pkg.go.dev/github.com/tailscale/hujson) ([BSD-3-Clause](https://github.com/tailscale/hujson/blob/20486734a56a/LICENSE))
  - [github.com/tailscale/netlink](https://pkg.go.dev/github.com/tailscale/netlink) ([Apache-2.0](https://github.com/tailscale/netlink/blob/cabfb018fe85/LICENSE))
- - [github.com/tailscale/walk](https://pkg.go.dev/github.com/tailscale/walk) ([BSD-3-Clause](https://github.com/tailscale/walk/blob/0fe267360a54/LICENSE))
+ - [github.com/tailscale/walk](https://pkg.go.dev/github.com/tailscale/walk) ([BSD-3-Clause](https://github.com/tailscale/walk/blob/325edb597026/LICENSE))
  - [github.com/tailscale/win](https://pkg.go.dev/github.com/tailscale/win) ([BSD-3-Clause](https://github.com/tailscale/win/blob/6580b55d49ca/LICENSE))
  - [github.com/tailscale/xnet/webdav](https://pkg.go.dev/github.com/tailscale/xnet/webdav) ([BSD-3-Clause](https://github.com/tailscale/xnet/blob/62b9a7c569f9/LICENSE))
  - [github.com/tc-hib/winres](https://pkg.go.dev/github.com/tc-hib/winres) ([0BSD](https://github.com/tc-hib/winres/blob/v0.2.1/LICENSE))
@@ -82,6 +82,5 @@ Windows][].  See also the dependencies in the [Tailscale CLI][].
 
 ## Additional Dependencies
 
- - [Nullsoft Scriptable Install System](https://nsis.sourceforge.io/) ([zlib/libpng](https://nsis.sourceforge.io/License))
  - [Wintun](https://www.wintun.net/) ([Prebuilt Binaries License](https://git.zx2c4.com/wintun/tree/prebuilt-binaries-license.txt))
  - [wireguard-windows](https://git.zx2c4.com/wireguard-windows/) ([MIT](https://git.zx2c4.com/wireguard-windows/tree/COPYING))
