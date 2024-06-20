@@ -46,6 +46,11 @@ func (w *Warnable) unhealthyState(ws *warningState) *UnhealthyState {
 		dependsOnWarnableCodes[i] = d.Code
 	}
 
+	// Here we tell the frontend that all Warnables depend on warmingUpWarnable. GUIs will silence all warnings until all
+	// their dependencies are healthy. This is a special case to prevent the GUI from showing a bunch of warnings when
+	// the backend is still warming up.
+	dependsOnWarnableCodes = append(dependsOnWarnableCodes, warmingUpWarnable.Code)
+
 	return &UnhealthyState{
 		WarnableCode: w.Code,
 		Severity:     w.Severity,

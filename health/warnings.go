@@ -212,3 +212,10 @@ var controlHealthWarnable = Register(&Warnable{
 		return fmt.Sprintf("The coordination server is reporting an health issue: %v", args[ArgError])
 	},
 })
+
+var warmingUpWarnable = Register(&Warnable{
+	Code:     "warming-up",
+	Title:    "Tailscale is starting",
+	Severity: SeverityLow,
+	Text:     StaticMessage("Tailscale is starting. Please wait."),
+})

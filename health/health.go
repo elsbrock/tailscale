@@ -91,6 +91,7 @@ type Tracker struct {
 	derpMap                 *tailcfg.DERPMap // last DERP map from control, could be nil if never received one
 	lastMapRequestHeard     time.Time        // time we got a 200 from control for a MapRequest
 	ipnState                string
+	ipnStateFirstSet        time.Time // when ipnState was first set
 	ipnWantRunning          bool
 	anyInterfaceUp          opt.Bool // empty means unknown (assume true)
 	udp4Unbound             bool
@@ -705,6 +706,12 @@ func (t *Tracker) SetIPNState(state string, wantRunning bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.ipnState = state
+	if t.ipnStateFirstSet.IsZero() {
+		// The first time we see an IPNState getting set, it means the backend is starting up. We store this timestamp.
+		// We use it to silence some warnings that are expected during startup.
+		t.ipnStateFirstSet = time.Now()
+		t.setUnhealthyLocked(warmingUpWarnable, nil)
+	}
 	t.ipnWantRunning = wantRunning
 	t.selfCheckLocked()
 }
@@ -858,6 +865,11 @@ var fakeErrForTesting = envknob.RegisterString("TS_DEBUG_FAKE_HEALTH_ERROR")
 // updateBuiltinWarnablesLocked performs a number of checks on the state of the backend,
 // and adds/removes Warnings from the Tracker as needed.
 func (t *Tracker) updateBuiltinWarnablesLocked() {
+	if !t.ipnStateFirstSet.IsZero() && time.Now().After(t.ipnStateFirstSet.Add(5*time.Second)) {
+		// After more than 5 seconds after the first IPNState was set, we consider the backend to be warmed up.
+		t.setHealthyLocked(warmingUpWarnable)
+	}
+
 	if t.checkForUpdates {
 		if cv := t.latestVersion; cv != nil && !cv.RunningLatest && cv.LatestVersion != "" {
 			if cv.UrgentSecurityUpdate {
